@@ -1,0 +1,1102 @@
+---
+title: "Forecasting Aftershock Sequences Using the Bayesian ETAS Model: Analysing the 2024 Uqturpan Earthquake in China"
+subtitle: "**R Code for Report Content**"
+author: "Yingming Gao"
+date: "2024-06-27" 
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+# 0 Load Packages
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, results='hide'}
+library(ggplot2)
+#install.packages("ggmap")
+library(ggmap)
+#install.packages("dplyr")
+library(dplyr)
+library(ETAS.inlabru)
+#install.packages("Rmisc")
+library(Rmisc)
+#install.packages("scatterplot3d") # Install
+library(scatterplot3d) # load
+library(rgl)
+#install.packages("akima")
+library(akima)
+#install.packages("reshape2")
+library(reshape2)
+library(dplyr)
+#install.packages("tidyverse")
+library(tidyverse)
+library(tibble)
+library(inlabru)
+#install.packages("scico")
+library(scico)
+library(INLA)
+library(sf)
+library(RColorBrewer)
+if(!require(ggregplot)){
+    devtools::install_github("gfalbery/ggregplot")
+    library(ggregplot)
+}
+#install.packages("geosphere")
+library(geosphere)
+```
+
+# 1 Earthquake Data EDA and Visualization
+
+## 1.1 The Magnitudes-Time Plot
+
+```{r,warning=FALSE}
+# read the earthquake data of Xinjiang wushi
+data <- read.csv("xinjiang_processed_data.csv")
+# create the data frame used for ETAS model
+earthquake_xj <- data.frame(
+  ts = as.POSIXct(data$ts),
+  magnitudes = data$magnitudes
+)
+# Create the ggplot chart mag-time
+p1 <- ggplot(data = earthquake_xj, aes(x = ts, y = magnitudes)) +
+  geom_point(shape = 1, size = earthquake_xj$magnitudes * 0.7, color="red") +
+  labs(x = "Time", y = "Magnitude") +  # Labels setup
+  theme_minimal() +  # Set the theme
+  theme(
+    # Add a black border around the plot
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    axis.ticks = element_line(color = "black"),  # Color of axis ticks
+    axis.line = element_line(color = "black"),  # Color of x and y axis lines
+    plot.title = element_text(hjust = 0.5)  # Center align plot title
+  )
+# Obtain the plot of cumulative number of events in real data
+n_points <- 100 # the number of time nodes
+start_time <- min(earthquake_xj$ts);end_time <- max(earthquake_xj$ts)
+t.breaks <- seq(start_time, end_time, length.out = n_points)
+# Calculate the cumulative number of events
+N.cumsum <- vapply(t.breaks, \(x) sum(earthquake_xj$ts < x), 0)
+df.real.cumsum.plot <- data.frame(ts = t.breaks, N.cum = N.cumsum)
+p2 <- ggplot(df.real.cumsum.plot, aes(ts, N.cum)) +
+  geom_line(color="blue") +
+  ylab("cumulative number of events")+
+  xlab("Time")+theme_minimal()+theme(
+    # Add a black border around the plot
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),  
+    axis.ticks = element_line(color = "black"),  # Color of axis ticks
+    axis.line = element_line(color = "black"),  # Color of x and y axis lines
+    plot.title = element_text(hjust = 0.5)  # Center align plot title
+  )
+multiplot(p1,p2,cols = 2)
+```
+
+## 1.2 The Locations of Earthquake Events on the Map
+
+```{r fig.align="center", fig.width=7, message=FALSE, warning=FALSE}
+# register google map API
+register_google(key = "AIzaSyByqnGFHiaf324I_L2pKVzEuZ6a-T_tBaQ")
+# Create the data frame for plotting earthquake map
+earthquake_map_data <- data.frame(
+  longitude = data$longitude,
+  latitude = data$latitude,
+  magnitudes = data$magnitudes,
+  ts = as.POSIXct(data$ts)
+)
+# set the range of longitude and latitude of wushi county
+earthquake_map_data<-
+  earthquake_map_data %>%
+  filter(longitude>=78.2, longitude<=80.0, latitude>=40.4, latitude <= 41.5)
+# Get the map data as the background
+map_center <- c(lon=mean(earthquake_map_data$longitude),
+                lat=mean(earthquake_map_data$latitude))
+map <- get_map(location = map_center, zoom = 10)
+# Plot earthquake locations and magnitudes
+earthquake_map <- 
+  ggmap(map) +
+  geom_point(data = earthquake_map_data, aes(x = longitude, 
+                                             y = latitude, size = magnitudes),
+             color = "red", alpha=0.3) +
+  geom_text(x=78.62,y=41.28,label="\u2605",size=10,color="orange")+
+  scale_size(range = c(1, 4)) + # Adjust the range of point sizes
+  labs(title = "Earthquake Locations and Magnitudes",
+       x = "Longitude(°E)",
+       y = "Latitude(°N)",
+       size = "Magnitude")+
+theme(plot.title = element_text(hjust=0.5))
+earthquake_map
+```
+
+## 1.3 The Spatial Distribution of Magnitudes
+
+```{r message=FALSE, warning=FALSE,fig.height=4}
+# Create the data frame
+earthquake_data <- data.frame(earthquake_map_data[,1:3])
+# Define the latitude and longitude intervals
+lon_breaks <- seq(floor(min(earthquake_data$longitude)),
+                  ceiling(max(earthquake_data$longitude)), by = 0.05)
+lat_breaks <- seq(floor(min(earthquake_data$latitude)),
+                  ceiling(max(earthquake_data$latitude)), by = 0.05)
+# Divide the area into regions
+earthquake_data <- earthquake_data %>%
+  mutate(
+    lon_bin = cut(longitude, breaks = lon_breaks, include.lowest = TRUE),
+    lat_bin = cut(latitude, breaks = lat_breaks, include.lowest = TRUE)
+  )
+aggregated_data <-
+  earthquake_data %>%
+  group_by(lon_bin,lat_bin) %>%
+  dplyr::summarise(sum=sum(magnitudes), 
+                   mean=(mean(magnitudes)), 
+                   max = max(magnitudes),n=n())
+# Extract the midpoint of each bin for plotting
+aggregated_data <- aggregated_data %>%
+  mutate(
+    lon = sapply(lon_bin, function(x)
+      mean(as.numeric(gsub("[^0-9.-]", "",
+                           unlist(strsplit(as.character(x), ",")))))),
+    lat = sapply(lat_bin, function(x)
+      mean(as.numeric(gsub("[^0-9.-]", "",
+                           unlist(strsplit(as.character(x), ",")))))
+  ))
+# Use akima package to implement interpolation
+# magnitudes
+interp_data <- with(aggregated_data, interp(lon, lat, max, nx=300, ny=300)) 
+# mean
+interp_data_1 <- with(aggregated_data, interp(lon, lat, mean, nx=300, ny=300)) 
+# replace the NA value with 0
+interp_data$z[is.na(interp_data$z)] <- 0
+interp_data_1$z[is.na(interp_data$z)] <- 0
+# Transfer the interpolated values into data frame
+interp_df <- data.frame(
+  longitude = rep(interp_data$x, each = length(interp_data$y)),
+  latitude = rep(interp_data$y, length(interp_data$x)),
+  max_magnitude = as.vector(t(as.matrix(interp_data$z)))
+)
+interp_df_1 <- data.frame(
+  longitude = rep(interp_data$x, each = length(interp_data_1$y)),
+  latitude = rep(interp_data$y, length(interp_data_1$x)),
+  average_magnitude = as.vector(t(as.matrix(interp_data_1$z)))
+)
+# plot the heatmap of Earthquake magnitudes
+p <- ggplot() +
+  geom_raster(data = interp_df, aes(x = longitude, 
+                                    y = latitude, fill = magnitudes),
+              interpolate = FALSE,alpha=0.6) +
+  geom_point(data = data.frame(x=78.62,y=41.28), aes(x = x, y = y),
+             color = "red", size = 2) +
+  scale_fill_gradientn(colours = terrain.colors(10))+
+  labs(title = "Earthquake Magnitudes Heatmap", x = "Longitude", 
+       y = "Latitude") +
+  theme_minimal()+theme(plot.title = element_text(hjust=0.5)) + 
+  coord_fixed(ratio=1)
+# Get the map data as the background
+map_center <- c(lon=mean(earthquake_map_data$longitude),
+                lat=mean(earthquake_map_data$latitude)-0.01)
+map <- get_map(location = map_center, zoom = 10)
+# plot of max magnitude 
+ggmap(map) +
+  geom_raster(data = interp_df, 
+              aes(x = longitude, y = latitude, 
+                  fill = max_magnitude),interpolate = FALSE,alpha=0.8) +
+  geom_point(data = data.frame(x=78.62,y=41.28), aes(x = x, y = y), 
+             color = "red", size = 2) +
+  scico::scale_fill_scico(palette = "vik")+
+  labs(title = "Earthquake Max Magnitudes Heatmap", x = "Longitude", 
+       y = "Latitude") +
+  theme_minimal()+theme(plot.title = element_text(hjust=0.5)) + 
+  coord_fixed(ratio=1)
+# plot of mean of magnitudes
+ggmap(map) +
+  geom_raster(data = interp_df_1, 
+              aes(x = longitude, y = latitude, 
+                  fill = average_magnitude),interpolate = FALSE,alpha=0.8) +
+  geom_point(data = data.frame(x=78.62,y=41.28), aes(x = x, y = y),
+             color = "red", size = 2) +
+  scico::scale_fill_scico(palette = "lajolla")+
+  labs(title = "Earthquake Average Magnitudes Heatmap", x = "Longitude", 
+       y = "Latitude") +
+  theme_minimal()+theme(plot.title = element_text(hjust=0.5)) + 
+  coord_fixed(ratio=1)
+```
+
+## 1.4 Dataset Split for Model Fitting and Test
+
+```{r}
+# Obtain the magnitude-time plot
+ggplot(earthquake_map_data, aes(ts, magnitudes)) +
+  geom_point(size = 1.5) +
+  geom_point(
+    data = earthquake_map_data[which.max(earthquake_map_data$magnitudes), ],
+    mapping = aes(ts, magnitudes),
+    color = "red", size = 3)+
+  theme_gray()+geom_vline(xintercept = as.POSIXct("2024/2/23 00:00:00"),
+                          linetype="dashed", color = "blue")
+# Split the data-set into training and test data 
+timeline <- as.POSIXct("2024-02-23 00:00:00")
+# Training data (2024/1/23-2024/2/23)
+xinjiang.train <- earthquake_map_data[which(earthquake_map_data$ts<=timeline),]
+# Test data (2024/2/23-2024/3/3)
+xinjiang.test <- earthquake_map_data[-which(earthquake_map_data$ts<=timeline),]
+```
+
+# 2 ETAS Model Fitting
+
+## 2.1 Set the Initial Values and Priors
+
+```{r, warning=FALSE}
+set.seed(111)
+# Fit the ETAS model on the training data
+# set up data.frame for model fitting
+xinjiang.bru.train <- data.frame(
+  ts = as.numeric(
+    difftime(xinjiang.train$ts, min(xinjiang.train$ts), units = "days")
+  ),
+  magnitudes = xinjiang.train$magnitudes,
+  # add event identifier
+  idx.p = 1:nrow(xinjiang.train)
+)
+# set copula transformations list
+link.f <- list(
+  mu = \(x) gamma_t(x, 0.3, 0.6),
+  K = \(x) unif_t(x, 0, 10),
+  alpha = \(x) unif_t(x, 0, 10),
+  c_ = \(x) unif_t(x, 0, 10),
+  p = \(x) unif_t(x, 1, 10)
+)
+# set inverse copula transformations list, for the ETAS model parameters
+inv.link.f <- list(
+  mu = \(x) inv_gamma_t(x, 0.3, 0.6),
+  K = \(x) inv_unif_t(x, 0, 10),
+  alpha = \(x) inv_unif_t(x, 0, 10),
+  c_ = \(x) inv_unif_t(x, 0, 10),
+  p = \(x) inv_unif_t(x, 1, 10)
+)
+# set up list of initial values, using inverse transformations
+th.init <- list(
+  th.mu = inv.link.f$mu(0.4),
+  th.K = inv.link.f$K(0.1),
+  th.alpha = inv.link.f$alpha(2.0),
+  th.c = inv.link.f$c_(0.1),
+  th.p = inv.link.f$p(1.5)
+)
+# Visualize the original priors and the transformed priors
+mu_sample <- rgamma(10000,0.3, 0.6)
+mu_sample_ETAS <- inv.link.f$c_(mu_sample)
+mu<- ggplot()+
+  geom_density(aes(x=mu_sample,color="mu-original"),linewidth=1)+
+  geom_density(aes(x=mu_sample_ETAS,color="mu-INLA"),linewidth=1)+theme_bw()
+K_sample <- runif(10000,0, 10)
+K_sample_ETAS <- inv.link.f$c_(mu_sample)
+K<- ggplot()+
+  geom_density(aes(x=K_sample,color="K-original"),linewidth=1)+
+  geom_density(aes(x=K_sample_ETAS,color="K-INLA"),linewidth=1)+theme_bw()
+multiplot(mu,K,cols = 1)
+```
+
+## 2.2 Obtain Magnitude Distribution Parameter Value
+
+```{r}
+# Fit the beta value in the magnitude distribution
+# Create a list of break points of magnitude
+mag.breaks <- seq(from = min(xinjiang.train$magnitudes), 
+                  to = max(xinjiang.train$magnitudes), 
+                  length.out = 30)
+# Creat a list for the counts of earthquake
+count.earthquake <- rep(NA,length(mag.breaks)) 
+for (i in 1:length(mag.breaks)) {
+  # Count the number of earthquake with magnitude >= M
+  count.earthquake[i] <- sum(xinjiang.train$magnitudes >= mag.breaks[i])
+}
+# Plot the counts vs. magnitude
+p1 <- ggplot(data=data.frame(mag.breaks, count.earthquake), 
+       aes(x = mag.breaks, y = count.earthquake)) +
+  geom_line(linewidth=1,color="orange") +             # Add a line (curve)
+  geom_point(size=3,shape=1,color="blue",stroke=1.5) + # Add points
+  labs(title = "Counts vs Magnitude",
+       x = "Magnitude",
+       y = "Number of M>=Magnitude") +
+  theme_minimal()+           # Use a minimal theme for a clean look
+  theme(plot.title = element_text(hjust=0.5))
+# Plot the log(counts) vs. magnitude
+p2 <- ggplot(data=data.frame(mag.breaks, count.earthquake=log(count.earthquake)), 
+       aes(x = mag.breaks, y = count.earthquake)) +
+  geom_line(linewidth=1,color="orange") +             # Add a line (curve)
+  geom_point(size=3,shape=1,color="blue",stroke=1.5) +  # Add points
+  labs(title = "Log(Counts) vs Magnitude",
+       x = "Magnitude",
+       y = "Logarithm of Number of M>=Magnitude") +
+  theme_minimal()+           # Use a minimal theme for a clean look
+  theme(plot.title = element_text(hjust=0.5))
+multiplot(p1,p2,cols = 2)
+```
+
+## 2.3 Fitting Process
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, results='hide'}
+# set up list of bru options for model fitting
+bru.opt.list <- list(
+  bru_verbose = 3, # type of visual output
+  bru_max_iter = 70, # maximum number of iterations
+  # bru_method = list(max_step = 0.5),
+  bru_initial = th.init
+) # parameters initial values
+
+# set the initial values
+M0 <- 1.5; T1 <- 0; T2 <- max(xinjiang.bru.train$ts)
+# Fit the ETAS model to the synthetic data
+xinjiang.train.fit <- Temporal.ETAS(
+  total.data = xinjiang.bru.train, # synthetic data
+  M0 = M0, # cut-off magnitude
+  T1 = T1, # start time 
+  T2 = T2, # end time 
+  link.functions = link.f,
+  coef.t. = 1,
+  delta.t. = 0.1,
+  N.max. = 5, # parameters for temporal binning
+  bru.opt = bru.opt.list # bru options
+)
+
+```
+
+## 2.4 Fitting Result
+
+```{r,fig.height = 7, fig.width = 10,warning=FALSE}
+# Obtain the summary of the fitted model
+summary(xinjiang.train.fit)
+# Plot the covergnece of each parameters
+ggplot(xinjiang.train.fit$bru_iinla$track, 
+       aes(x = iteration, y = mode, group = effect, color = effect)) +
+  geom_line(size = 1) +
+  facet_wrap(~ effect, scales = 'free') +
+  labs(title = "Model Parameters vs. Iteration",
+       x = "Iteration",
+       y = "Mode",
+       color = "Items") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        axis.text = element_text(size = 12),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12))
+```
+
+```{r,fig.height = 6, fig.width = 9, warning=FALSE}
+# Analyse the posterior distribution
+# create input list to explore model output
+input_list <- list(
+  model.fit = xinjiang.train.fit,
+  link.functions = link.f
+)
+# retrieve marginal posterior distributions, the model and the link function
+post.list <- get_posterior_param(input.list = input_list)
+# plot marginal posteriors of ETAS parameters
+ggplot(post.list$post.df, aes(x = x, y = y, group = param, color = param)) +
+  geom_line(size = 1) +
+  facet_wrap(~ param, scales = 'free') +
+  labs(title = "Posterior Distributions of Model Parameters",
+       x = "Value",
+       y = "Density",
+       color = "parameters") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        axis.text = element_text(size = 12),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12))
+```
+
+```{r}
+# Obtain the mode, mean, 95% confidence interval
+pos.alpha <- post.list$post.df[post.list$post.df$param=="alpha",]
+pos.c <- post.list$post.df[post.list$post.df$param=="c",]
+pos.K <- post.list$post.df[post.list$post.df$param=="K",]
+pos.mu <- post.list$post.df[post.list$post.df$param=="mu",]
+pos.p <- post.list$post.df[post.list$post.df$param=="p",]
+# For the mode, find the value with the biggest density
+mode.alpha <- pos.alpha$x[which.max(pos.alpha$y)]
+mode.c <- pos.c$x[which.max(pos.c$y)]
+mode.K <- pos.K$x[which.max(pos.K$y)]
+mode.mu <- pos.mu$x[which.max(pos.mu$y)]
+mode.p <- pos.p$x[which.max(pos.p$y)]
+# For the mean, get the sum of product of value and density
+mean.alpha <- sum(pos.alpha$x * pos.alpha$y) / sum(pos.alpha$y)
+mean.c <- sum(pos.c$x * pos.c$y) / sum(pos.c$y)
+mean.K <- sum(pos.K$x * pos.K$y) / sum(pos.K$y)
+mean.mu <- sum(pos.mu$x * pos.mu$y) / sum(pos.mu$y)
+mean.p <- sum(pos.p$x * pos.p$y) / sum(pos.p$y)
+# Function to compute quantiles based on densities
+compute_confidence_interval <- function(x_values, y_densities) {
+  # Normalize densities
+  y_densities <- y_densities / sum(y_densities)
+  # Compute cumulative probabilities
+  cumulative_prob <- cumsum(y_densities)
+  # Find the indices corresponding to cumulative probabilities for 2.5% and 97.5%
+  lower_index <- which.max(cumulative_prob >= 0.025)
+  upper_index <- which.min(cumulative_prob <= 0.975)
+  # Determine the quantiles based on the computed indices
+  lower_quantile <- quantile(x_values, probs = cumulative_prob[lower_index])
+  upper_quantile <- quantile(x_values, probs = cumulative_prob[upper_index])
+  # Return confidence interval as a named vector
+  return(c(lower_quantile = lower_quantile, upper_quantile = upper_quantile))
+}
+# Calculate confidence interval
+ci.alpha <- compute_confidence_interval(pos.alpha$x, pos.alpha$y)
+ci.c <- compute_confidence_interval(pos.c$x, pos.c$y)
+ci.K <- compute_confidence_interval(pos.K$x, pos.K$y)
+ci.mu <- compute_confidence_interval(pos.mu$x, pos.mu$y)
+ci.p <- compute_confidence_interval(pos.p$x, pos.p$y)
+```
+
+## 2.5 Cut-off Magnitude's Impact
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, results='hide'}
+# Use different M0 values to fit the ETAS model
+M0.list <- c(2,2.5,3) # Create a list of M0 values
+# Create a empty list for storing mean and confidence intervals
+data.cutoff <- list(alpha=matrix(NA,nrow=3,ncol=3),
+                    c=matrix(NA,nrow=3,ncol=3),
+                    K=matrix(NA,nrow=3,ncol=3),
+                    mu=matrix(NA,nrow=3,ncol=3),
+                    p=matrix(NA,nrow=3,ncol=3))
+for (i in 1:3) {
+  M0 <- M0.list[i]
+  # Fit the ETAS model to the synthetic data
+  xinjiang.train.fit.1 <- Temporal.ETAS(
+    total.data = xinjiang.bru.train, # synthetic data
+    M0 = M0, # cut-off magnitude
+    T1 = T1, # start time 
+    T2 = T2, # end time 
+    link.functions = link.f,
+    coef.t. = 1,
+    delta.t. = 0.1,
+    N.max. = 5, # parameters for temporal binning
+    bru.opt = bru.opt.list # bru options
+  )
+  # create input list to explore model output
+  input_list.1 <- list(
+    model.fit = xinjiang.train.fit.1,
+    link.functions = link.f
+  )
+  # retrieve marginal posterior distributions, the model and the link function
+  post.list.1 <- get_posterior_param(input.list = input_list.1)
+  # Obtain the mode, mean, 95% confidence interval
+  pos.alpha.1 <- post.list.1$post.df[post.list.1$post.df$param=="alpha",]
+  pos.c.1 <- post.list.1$post.df[post.list.1$post.df$param=="c",]
+  pos.K.1 <- post.list.1$post.df[post.list.1$post.df$param=="K",]
+  pos.mu.1 <- post.list.1$post.df[post.list.1$post.df$param=="mu",]
+  pos.p.1 <- post.list.1$post.df[post.list.1$post.df$param=="p",]
+  # For the mean, get the sum of product of value and density
+  mean.alpha.1 <- sum(pos.alpha.1$x * pos.alpha.1$y) / sum(pos.alpha.1$y)
+  mean.c.1 <- sum(pos.c.1$x * pos.c.1$y) / sum(pos.c.1$y)
+  mean.K.1 <- sum(pos.K.1$x * pos.K.1$y) / sum(pos.K.1$y)
+  mean.mu.1 <- sum(pos.mu.1$x * pos.mu.1$y) / sum(pos.mu.1$y)
+  mean.p.1 <- sum(pos.p.1$x * pos.p.1$y) / sum(pos.p.1$y)
+  # Store the mean into the list
+  data.cutoff$alpha[i,1] <- mean.alpha.1; data.cutoff$c[i,1] <- mean.c.1; 
+  data.cutoff$K[i,1] <- mean.K.1; data.cutoff$mu[i,1] <- mean.mu.1;
+  data.cutoff$p[i,1] <- mean.p.1; 
+  # Calculate confidence intervals
+  ci.alpha.1 <- compute_confidence_interval(pos.alpha.1$x, pos.alpha.1$y)
+  ci.c.1 <- compute_confidence_interval(pos.c.1$x, pos.c.1$y)
+  ci.K.1 <- compute_confidence_interval(pos.K.1$x, pos.K.1$y)
+  ci.mu.1 <- compute_confidence_interval(pos.mu.1$x, pos.mu.1$y)
+  ci.p.1 <- compute_confidence_interval(pos.p.1$x, pos.p.1$y)
+  # Store the confidence intervals into the list
+  data.cutoff$alpha[i,2:3] <- ci.alpha.1; data.cutoff$c[i,2:3] <- ci.c.1; 
+  data.cutoff$K[i,2:3] <- ci.K.1; data.cutoff$mu[i,2:3] <- ci.mu.1;
+  data.cutoff$p[i,2:3] <- ci.p.1;  
+}
+```
+
+```{r,fig.height = 5, fig.width = 8}
+M0 <- 1.5 # original cut-off magnitude
+# Plot the mean and confidence intervals against parameter value
+cut.alpha <- cbind(c(M0,M0.list),rbind(c(mean.alpha,ci.alpha),
+                                       data.cutoff$alpha))
+cut.alpha <- data.frame(M0=cut.alpha[,1],mean=cut.alpha[,2],
+                        low_ci=cut.alpha[,3],
+                        high.ci=cut.alpha[,4],param=rep("alpha",4))
+cut.c <- cbind(c(M0,M0.list),rbind(c(mean.c,ci.c),data.cutoff$c))
+cut.c <- data.frame(M0=cut.c[,1],mean=cut.c[,2],
+                        low_ci=cut.c[,3],
+                        high.ci=cut.c[,4],param=rep("c",4))
+cut.K <- cbind(c(M0,M0.list),rbind(c(mean.K,ci.K),data.cutoff$K))
+cut.K <- data.frame(M0=cut.K[,1],mean=cut.K[,2],
+                        low_ci=cut.K[,3],
+                        high.ci=cut.K[,4],param=rep("K",4))
+cut.mu <- cbind(c(M0,M0.list),rbind(c(mean.mu,ci.mu),data.cutoff$mu))
+cut.mu <- data.frame(M0=cut.mu[,1],mean=cut.mu[,2],
+                        low_ci=cut.mu[,3],
+                        high.ci=cut.mu[,4],param=rep("mu",4))
+cut.p <- cbind(c(M0,M0.list),rbind(c(mean.p,ci.p),data.cutoff$p))
+cut.p <- data.frame(M0=cut.p[,1],mean=cut.p[,2],
+                        low_ci=cut.p[,3],
+                        high.ci=cut.p[,4],param=rep("p",4))
+data.ETAS.cutoff <- rbind(cut.alpha,cut.c,cut.K,cut.mu,cut.p)
+
+ggplot(data.ETAS.cutoff, aes(x = M0, y = mean, group= param, color=param)) +
+  geom_line(linewidth=0.8) +
+  geom_point(size=2)+
+  geom_ribbon(aes(x = M0, ymin = low_ci, ymax = high.ci,fill=param), 
+              alpha = 0.25)+
+  labs(title = "ETAS Parameters' Posterior Mean and 95% Confidence Intervals",
+       x = "Cut-off Magnitude (M0)",
+       y = "Parameter Value",
+       color = "Parameters",
+       fill = "Parameters") +
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+```
+
+## 2.6 Fitting Period's Impact
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, results='hide'}
+M0 <- 1.5
+# Fit the ETAS model with different time-period
+# Create a list of time-periods
+period.list <- c(6,12,18,24,30) 
+# Create a empty list for storing mean and confidence intervals
+data.period <- list(alpha=matrix(NA,nrow=5,ncol=3),
+                    c=matrix(NA,nrow=5,ncol=3),
+                    K=matrix(NA,nrow=5,ncol=3),
+                    mu=matrix(NA,nrow=5,ncol=3),
+                    p=matrix(NA,nrow=5,ncol=3))
+for (i in 1:5) {
+  T2 <- period.list[i] # Change the end time
+  index <- xinjiang.bru.train$ts<=T2
+  # Fit the ETAS model to the synthetic data
+  xinjiang.train.fit.1 <- Temporal.ETAS(
+    total.data = xinjiang.bru.train[index,], # synthetic data
+    M0 = M0, # cut-off magnitude
+    T1 = T1, # start time 
+    T2 = max(xinjiang.bru.train[index,]$ts), # end time 
+    link.functions = link.f,
+    coef.t. = 1,
+    delta.t. = 0.1,
+    N.max. = 5, # parameters for temporal binning
+    bru.opt = bru.opt.list # bru options
+  )
+  # create input list to explore model output
+  input_list.1 <- list(
+    model.fit = xinjiang.train.fit.1,
+    link.functions = link.f
+  )
+  # retrieve marginal posterior distributions, the model and the link function
+  post.list.1 <- get_posterior_param(input.list = input_list.1)
+  # Obtain the mode, mean, 95% confidence interval
+  pos.alpha.1 <- post.list.1$post.df[post.list.1$post.df$param=="alpha",]
+  pos.c.1 <- post.list.1$post.df[post.list.1$post.df$param=="c",]
+  pos.K.1 <- post.list.1$post.df[post.list.1$post.df$param=="K",]
+  pos.mu.1 <- post.list.1$post.df[post.list.1$post.df$param=="mu",]
+  pos.p.1 <- post.list.1$post.df[post.list.1$post.df$param=="p",]
+  # For the mean, get the sum of product of value and density
+  mean.alpha.1 <- sum(pos.alpha.1$x * pos.alpha.1$y) / sum(pos.alpha.1$y)
+  mean.c.1 <- sum(pos.c.1$x * pos.c.1$y) / sum(pos.c.1$y)
+  mean.K.1 <- sum(pos.K.1$x * pos.K.1$y) / sum(pos.K.1$y)
+  mean.mu.1 <- sum(pos.mu.1$x * pos.mu.1$y) / sum(pos.mu.1$y)
+  mean.p.1 <- sum(pos.p.1$x * pos.p.1$y) / sum(pos.p.1$y)
+  # Store the mean into the list
+  data.period$alpha[i,1] <- mean.alpha.1; data.period$c[i,1] <- mean.c.1; 
+  data.period$K[i,1] <- mean.K.1; data.period$mu[i,1] <- mean.mu.1; 
+  data.period$p[i,1] <- mean.p.1; 
+  # Calculate confidence intervals
+  ci.alpha.1 <- compute_confidence_interval(pos.alpha.1$x, pos.alpha.1$y)
+  ci.c.1 <- compute_confidence_interval(pos.c.1$x, pos.c.1$y)
+  ci.K.1 <- compute_confidence_interval(pos.K.1$x, pos.K.1$y)
+  ci.mu.1 <- compute_confidence_interval(pos.mu.1$x, pos.mu.1$y)
+  ci.p.1 <- compute_confidence_interval(pos.p.1$x, pos.p.1$y)
+  # Store the confidence intervals into the list
+  data.period$alpha[i,2:3] <- ci.alpha.1; data.period$c[i,2:3] <- ci.c.1; 
+  data.period$K[i,2:3] <- ci.K.1; data.period$mu[i,2:3] <- ci.mu.1; 
+  data.period$p[i,2:3] <- ci.p.1;  
+}
+```
+
+```{r}
+# Plot the mean and confidence intervals against parameter value
+period.alpha <- cbind(period.list,data.period$alpha)
+period.alpha <- data.frame(Time=period.alpha[,1],
+                           mean=period.alpha[,2],
+                        low_ci=period.alpha[,3],
+                        high.ci=period.alpha[,4],param=rep("alpha",5))
+period.c <- cbind(period.list,data.period$c)
+period.c <- data.frame(Time=period.c[,1],mean=period.c[,2],
+                        low_ci=period.c[,3],
+                        high.ci=period.c[,4],param=rep("c",5))
+period.K <- cbind(period.list,data.period$K)
+period.K <- data.frame(Time=period.K[,1],mean=period.K[,2],
+                        low_ci=period.K[,3],
+                        high.ci=period.K[,4],param=rep("K",5))
+period.mu <- cbind(period.list,data.period$mu)
+period.mu <- data.frame(Time=period.mu[,1],mean=period.mu[,2],
+                        low_ci=period.mu[,3],
+                        high.ci=period.mu[,4],param=rep("mu",5))
+period.p <- cbind(period.list,data.period$p)
+period.p <- data.frame(Time=period.p[,1],mean=period.p[,2],
+                        low_ci=period.p[,3],
+                        high.ci=period.p[,4],param=rep("p",5))
+data.ETAS.period <- rbind(period.alpha,period.c,period.K,period.mu,period.p)
+ggplot(data.ETAS.period, aes(x = Time, y = mean, group= param, color=param)) +
+  geom_line(linewidth=0.8) +
+  geom_point(size=2)+
+  geom_ribbon(aes(x = Time, ymin = low_ci, ymax = high.ci,fill=param),
+              alpha = 0.25)+
+  labs(title = "ETAS Parameters' Posterior Mean and 95% Confidence Intervals",
+       x = "Time",
+       y = "Parameter Value",
+       color = "Parameters",
+       fill = "Parameters") +
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+```
+
+## 2.7 Goodness of Fit
+
+```{r message=FALSE, warning=FALSE}
+set.seed(111)
+# Generate parameters set form the posterior distribution
+post.samp <- post_sampling(
+  input.list = input_list,
+  n.samp = 1500
+)
+# correlation between parameters
+pair.plot <- post_pairs_plot(
+  post.samp = post.samp,
+  input.list = NULL,
+  n.samp = NULL,
+  max.batch = 1000
+)
+pair.plot$pair.plot+theme_bw()
+```
+
+```{r}
+# check posterior number of events
+T2 <- max(xinjiang.bru.train$ts)
+input_list$T12 <- c(T1, T2)
+input_list$M0 <- M0
+input_list$catalog.bru <- xinjiang.bru.train
+# get the number of events
+N.post <- get_posterior_N(input.list = input_list)
+multiplot(N.post$post.plot+theme_bw(), 
+          N.post$post.plot.shaded+theme_bw(), cols = 2)
+# posterior of the triggering function
+triggering_fun_plot(
+  input.list = input_list,
+  post.samp = post.samp,
+  n.samp = NULL, magnitude = 7.1,
+  t.end = 10, n.breaks = 100
+)
+```
+
+```{r}
+# Calculate the cumulative nubmer of events
+n_points <- 51 # the number of time nodes for 50 intervals
+start_time <- min(xinjiang.bru.train$ts);end_time <- max(xinjiang.bru.train$ts)
+# Generate the time nodes
+t.breaks <- seq(start_time, end_time, length.out = n_points)
+# Create a matrix to store cumulative numbers
+N.cum <- matrix(NA, ncol = 3,nrow = n_points-1) 
+N.df <- data.frame()
+for (i in 2:length(t.breaks)) {
+  input_list$T12 <- c(T1,t.breaks[i])# time-period
+  input_list$catalog.bru <- 
+    xinjiang.bru.train[xinjiang.bru.train$ts<=t.breaks[i],]# events in period
+  # get the number of events
+  N.df <- get_posterior_N(input.list = input_list)$post.df
+  N.mean <- N.df$N # nubmer of events
+  N.density <- N.df$mean # corresponding density
+  # For the mode, find the value with the biggest density
+  N.cum[i-1,1] <- N.mean[which.max(N.density)]
+  # compute_confidence_interval
+  N.cum[i-1,2:3] <- compute_confidence_interval(N.mean,N.density)
+}
+N.cum <- rbind(c(0,0,0),N.cum) # add 0 point
+N.cum <- data.frame(Time=t.breaks,mean=N.cum[,1],
+                        low_ci=N.cum[,2],
+                        high.ci=N.cum[,3])
+# Obtain the real number of events
+N.cumsum <- vapply(t.breaks, \(x) sum(xinjiang.bru.train$ts <= x), 0)
+df.real.cumsum.plot <- data.frame(Time = t.breaks, N.cum = N.cumsum)
+# Plot using ggplot2
+ggplot() +
+   # Add color mapping for points
+  geom_point(data = N.cum, aes(x = Time, y = mean, color = "Mean"), size = 2) + 
+  geom_line(data = df.real.cumsum.plot, aes(x = Time, y = N.cum, 
+                                            color = "Actual"), size = 0.8,
+            linetype="dashed") +  # Add color mapping for line
+  # Add fill mapping for ribbon
+  geom_ribbon(data = N.cum, aes(x = Time, ymin = low_ci, ymax = high.ci, 
+                                fill = "CI"), alpha = 0.25) +  
+  labs(title = "Mode and 95% Confidence Intervals of Cumulative Number",
+       x = "Days",
+       y = "Cumulative Number") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+        axis.text = element_text(size = 10),
+        axis.title = element_text(size = 10, face = "bold")) +
+  # Customize colors for points and line
+  scale_color_manual(name = "Legend", 
+                     values = c("Mean" = "blue", "Actual" = "red"),  
+                     labels = c("Mode Value", "Actual Value")) +  
+  scale_fill_manual(name = "Legend", 
+                    values = c("CI" = "blue"),  # Customize color for ribbon
+                    labels = c("95% CI")) +  # Customize legend label
+  # Adjust legend title and size for line and points
+  guides(color = guide_legend(title = "Line and Points", 
+                              override.aes = list(size = 3))) 
+```
+
+```{r}
+#Calculate the transformed time
+N.cum$trans.Time <- N.cum$mean/(t.breaks[2]-t.breaks[1])*(t.breaks[2]-t.breaks[1])
+df.real.cumsum.plot$trans.Time <- N.cum$trans.Time
+# Plot cumulative number against transformed time
+ggplot() +
+  # Add color mapping for points
+  geom_point(data = N.cum, aes(x = trans.Time, y = mean, 
+                               color = "Mean"), size = 2) +  
+  geom_line(data = df.real.cumsum.plot, aes(x = trans.Time, 
+                                            y = N.cum, color = "Actual"), 
+            size = 0.8,linetype="dashed") +  # Add color mapping for line
+  geom_ribbon(data = N.cum, aes(x = trans.Time, ymin = low_ci, 
+                                ymax = high.ci, fill = "CI"), 
+              alpha = 0.25) +  # Add fill mapping for ribbon
+  labs(title = "Mode and 95% Confidence Intervals of Cumulative Number",
+       x = "Transformed Time",
+       y = "Cumulative Number") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+        axis.text = element_text(size = 10),
+        axis.title = element_text(size = 10, face = "bold")) +
+  # Customize colors for points and line
+  scale_color_manual(name = "Legend", 
+                     values = c("Mean" = "blue", "Actual" = "red"),  
+                     labels = c("Actual Value","Mode Value")) +  
+  scale_fill_manual(name = "Legend", 
+                    values = c("CI" = "purple"),  # Customize color for ribbon
+                    labels = c("95% CI")) +  # Customize legend label
+  # Adjust legend title and size for line and points
+  guides(color = guide_legend(title = "Line and Points", 
+                              override.aes = list(size = 3))) 
+```
+
+# 3 Earthquake Forecasting
+
+## 3.1 24h Forecasting
+
+```{r,fig.height=2, message=FALSE, warning=FALSE}
+# Forecasting
+# Obtain the estimated value of beta.p
+beta.p <- 1.36*log(10)
+# The start-end time
+xinjiang.bru.test <- data.frame(
+  ts = as.numeric(
+    difftime(xinjiang.test$ts, min(xinjiang.train$ts), units = "days")
+  ),
+  magnitudes = xinjiang.test$magnitudes,
+  # add event identifier
+  idx.p = 1:nrow(xinjiang.test)
+)
+# Create a matrix for forecast mean and quantiles
+fore.num <- matrix(NA,nrow=6,ncol=3)
+# Create a list for observed number of events
+obs.num <- rep(NA,6)
+start.point <- 33.5# Time point to start forecasting
+for (i in 1:6) {
+  start.time <- start.point+i-1
+  # Set the known events in the training dataset
+  history.event <- xinjiang.bru.test[xinjiang.bru.test$ts<=start.time,]
+  Ht.fore <- rbind(history.event,xinjiang.bru.train) # Update the events
+  # produce forecast
+  T0.fore <- start.time; T1.fore <- T0.fore+1
+  daily.fore <- Temporal.ETAS.forecast(
+    post.samp = post.samp, # ETAS parameters posterior samples
+    n.cat = nrow(post.samp), # number of synthetic catalogues
+    beta.p = beta.p, # magnitude distribution parameter
+    M0 = 1.5, # cutoff magnitude
+    T1 = T0.fore, # forecast starting time
+    T2 = T1.fore, # forecast end time
+    Ht = Ht.fore, # known events
+    ncore = 2# number of cores
+  ) 
+  # find number of events per catalogue
+  N.fore <- vapply(
+    seq_len(daily.fore$n.cat),
+    \(x) sum(daily.fore$fore.df$cat.idx == x), 0)
+  # find number of observed events in the forecasting period
+  N.obs <- sum(xinjiang.bru.test$ts<T1.fore&xinjiang.bru.test$ts>=T0.fore)
+  # Store the mean and quantiles of events number
+  fore.num[i,1] <- mean(N.fore)
+  fore.num[i,2] <- quantile(N.fore, probs = 0)
+  fore.num[i,3] <- quantile(N.fore, probs = 1)
+  # Store the observed number of events
+  obs.num[i] <- N.obs
+  # plot the distribution
+  plot_title <- paste("Day", i)
+  p <- ggplot() +
+    geom_histogram(aes(x = N.fore, y = after_stat(density)), 
+                   binwidth = 1, fill = "skyblue", color = "black") +
+    geom_vline(xintercept = N.obs, color = "red", 
+               linetype = "dashed", size = 0.8)+theme_bw()+
+    labs(title = plot_title,
+       x = "N.fore",
+       y = "Density") +
+    theme(
+    plot.title = element_text(hjust = 0.5, size = 8),
+    axis.title = element_text(size = 7),
+    axis.text = element_text(size = 6))
+  print(p)
+  # Save plot to file
+  filename <- paste("plot_", i, ".png", sep = "")
+  ggsave(filename, plot = p, width = 3, height = 4, dpi = 300)
+}
+```
+
+```{r}
+#Plot the forecast mean and predicted interval
+# Convert the matrix to a data frame
+fore.df <- as.data.frame(fore.num)
+colnames(fore.df) <- c("mean", "lower", "upper")
+fore.df$x <- 1:nrow(fore.df)  # Add an x column for the x-axis
+# Create the plot
+ggplot(fore.df, aes(x = x)) +
+  geom_line(aes(y = mean, color = "Predicted Mean"), size = 1) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, 
+                  fill = "Predicted Interval"), alpha = 0.2) +
+  geom_point(aes(y = obs.num, color = "Observed"), size = 2) +
+  scale_color_manual(name = "Legend", 
+                     values = c("Predicted Mean" = "blue", "Observed" = "red")) +
+  scale_fill_manual(name = "Legend", values = c("Predicted Interval" = "blue")) +
+  labs(title = "Predicted and Observed Number of Events",
+       x = "Predicted Day",
+       y = "Number of Events") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, size = 12))
+```
+
+```{r}
+# Analyse the predicted magnitude
+beta.p <- 1*log(10) #beta.p use b=1
+start.time <- 33.5
+  # Set the known events in the training dataset
+  history.event <- xinjiang.bru.test[xinjiang.bru.test$ts<=start.time,]
+  Ht.fore <- rbind(history.event,xinjiang.bru.train) # Update the events
+  # produce forecast
+  T0.fore <- start.time; T1.fore <- T0.fore+1
+  daily.fore <- Temporal.ETAS.forecast(
+    post.samp = post.samp, # ETAS parameters posterior samples
+    n.cat = nrow(post.samp), # number of synthetic catalogues
+    beta.p = beta.p, # magnitude distribution parameter
+    M0 = 1.5, # cutoff magnitude
+    T1 = T0.fore, # forecast starting time
+    T2 = T1.fore, # forecast end time
+    Ht = Ht.fore, # known events
+    ncore = 2# number of cores
+  ) 
+```
+
+```{r}
+# Obtain the biggest magnitude and average magnitude
+forecast.df <- daily.fore$fore.df
+mag.max <- c();mag.mean <- c()
+for (i in 1:daily.fore$n.cat) {
+  # Obtain the maximum magnitude
+  mag.max[i] <- max(forecast.df[forecast.df$cat.idx==i,]$magnitudes)
+  # Average magnitude
+  mag.mean[i] <- median(forecast.df[forecast.df$cat.idx==i,]$magnitudes)
+}
+# True value
+mag.index <- xinjiang.bru.test$ts>=start.point&xinjiang.bru.test$ts<start.point+1
+mag.max.true <- max(xinjiang.bru.test[mag.index,]$magnitudes)
+mag.mean.true <- median(xinjiang.bru.test[mag.index,]$magnitudes)
+p1<- ggplot() +
+    geom_histogram(aes(x = mag.max, y = after_stat(density)), 
+                   binwidth = 0.2, fill = "coral", color = "black") +
+    geom_vline(xintercept = mag.max.true, color = "blue", 
+               linetype = "dashed", size = 0.8)+theme_bw()+
+    labs(title = "Density of Predicted Max Magnitude",
+       x = "Max Magnitude",
+       y = "Density")+theme(
+    plot.title = element_text(hjust = 0.5, size = 10),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8))
+p2<- ggplot() +
+    geom_histogram(aes(x = mag.mean, y = after_stat(density)), 
+                   binwidth = 0.05, fill = "plum", color = "black") +
+    geom_vline(xintercept = mag.mean.true, color = "blue", 
+               linetype = "dashed", size = 0.8)+theme_bw()+
+    labs(title = "Density of Predicted Median Magnitude",
+       x = "Median Magnitude",
+       y = "Density")+theme(
+    plot.title = element_text(hjust = 0.5, size = 10),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8))
+multiplot(p1,p2,cols=2)
+```
+
+```{r}
+# Plot the simulated magnitude-ts with real data
+# generate catalogues as list of lists
+multi.synth.cat.df <- Temporal.ETAS.forecast(
+    post.samp = post.samp, # ETAS parameters posterior samples
+    n.cat = 8, # number of synthetic catalogues
+    beta.p = beta.p, # magnitude distribution parameter
+    M0 = 1.5, # cutoff magnitude
+    T1 = min(xinjiang.bru.test$ts), # forecast starting time
+    T2 = max(xinjiang.bru.test$ts), # forecast end time
+    Ht = Ht.fore, # known events
+    ncore = 2# number of cores
+  )$fore.df
+# we need to bing the synthetics with the observed catalogue for plotting
+cat.df.for.plotting <- rbind(
+  multi.synth.cat.df,
+  cbind(xinjiang.bru.test[, c("ts", "magnitudes")],
+    gen = NA,
+    cat.idx = "observed"
+  )
+)
+# plot synthertic sequences and real sequence
+ggplot(cat.df.for.plotting, aes(ts, magnitudes)) +
+  geom_point(size = 1.5, shape=20) +
+  geom_point(
+    data = xinjiang.bru.test[which.max(xinjiang.bru.test$magnitudes), ],
+    mapping = aes(ts, magnitudes),
+    color = "red"
+  ) +
+  facet_wrap(facets = ~cat.idx)+theme_bw()
+```
+
+## 3.2 SPDE Models for Forecasting Spatial Distribution
+
+```{r,fig.height=5}
+set.seed(111)  # Set a seed for reproducibility
+# Plot the longitude and latitude of the training data to visualize the positions
+plot(xinjiang.train$longitude, xinjiang.train$latitude)
+# Create a boundary for the spatial domain using a non-convex hull
+domain <- inla.nonconvex.hull(as.matrix(xinjiang.train[, 1:2]), 
+                              convex = -0.02, concave = -0.02, 
+                              resolution = c(150, 150))
+# Create a mesh for the spatial domain with specified maximum edge lengths and 
+# a cutoff value
+mesh <- inla.mesh.2d(boundary = domain, max.edge = c(0.04, 0.08), cutoff = 0.02)
+plot(mesh)
+# Define the locations for the SPDE model using longitude and latitude 
+# from the training data
+Locations <- data.frame(easting = xinjiang.train$longitude, 
+                        northing = xinjiang.train$latitude) 
+
+# Define the SPDE model with prior distributions for range and sigma
+loc.spde <- inla.spde2.pcmatern(mesh = mesh, 
+           prior.range = c(1, 0.1), 
+           prior.sigma = c(200, 0.1))  # Prior
+# Convert the Locations dataframe to a spatial feature geometry
+xinjiang.train$geometry <- 
+  sf::st_as_sf(Locations, coords = c("easting", "northing"))$geometry
+# Define the first formula for the model, fitting magnitudes as a function 
+# of longitude, latitude, and an intercept
+formula_fit_1 <- magnitudes ~ longitude + latitude + Intercept(1)
+# Fit the first model using the bru function from the inlabru package, 
+# with a Gaussian family and specified control options
+q2.m1.bru <- bru(components = formula_fit_1, family = "gaussian", 
+                 data = xinjiang.train,
+                 samplers = domain,
+                 domain = list(coordinates = mesh),
+                 options = list(control.inla = list(tolerance = 1e-10)))
+# Summarize the results of the first model fit
+summary(q2.m1.bru)
+# Define the second formula for the model, including the spatial 
+# field defined by the SPDE model
+formula_fit_2 <- magnitudes ~ floc(geometry, model = loc.spde) + longitude + latitude + Intercept(1)
+# Fit the second model using the bru function, with a Gaussian family and 
+# specified control options
+q2.m2.bru <- bru(components = formula_fit_2, family = "gaussian", 
+                 data = xinjiang.train,
+                 samplers = domain,
+                 domain = list(coordinates = mesh),
+                 options = list(control.inla = list(tolerance = 1e-10)))
+# Summarize the results of the second model fit
+summary(q2.m2.bru)
+```
+
+```{r,warning=FALSE}
+set.seed(111)
+# Add distance to epicenter as a co-variate
+# Reference point-epicenter
+ref_longitude <- 78.6
+ref_latitude <- 41.2
+# Function to calculate distance to the reference point
+calculate_distance <- function(lon, lat) {
+  # Convert meters to kilometers
+  distHaversine(c(lon, lat), c(ref_longitude, ref_latitude))/1000
+}
+# Apply the function to each point in the data frame
+xinjiang.train$distance_to_ref <- 
+  mapply(calculate_distance, xinjiang.train$longitude, xinjiang.train$latitude)
+formula_fit_3 <- 
+  magnitudes ~ floc(geometry, model = loc.spde)+ distance_to_ref+Intercept(1)
+q2.m3.bru <- bru(components=formula_fit_3, family = "gaussian",
+                 data=xinjiang.train, samplers = domain,
+                 domain = list(coordinates = mesh),
+                 options=list(
+    control.inla = list(
+      tolerance = 1e-10,seed=111,initial.values = list(Intercept = 0)
+    )))
+summary(q2.m3.bru)
+set.seed(111)
+# Visualize the mean of spatial random effect
+pix <- fm_pixels(mesh, dims = c(300, 300))
+pred <- predict(q2.m3.bru, pix, ~ floc)
+ggplot() + gg(pred, geom = "tile") +
+ggtitle("Posterior mean of spatial random effect")+ 
+  scale_fill_scico(palette = "vik", limits = range(pred$mean))+theme_bw()+xlab("longitude")+ylab("latitude")+
+  theme(plot.title = element_text(hjust = 0.5, size = 12))
+```
+
+```{r,warning=FALSE}
+# Create a boundary for the test dataset
+domain1 <- inla.nonconvex.hull(as.matrix(xinjiang.test[,1:2]),
+                               convex = -0.02, concave = -0.02, 
+                               resolution = c(150, 150))
+# Create a mesh
+mesh1 <- inla.mesh.2d(boundary = domain1, max.edge = c(0.04, 0.08), 
+                      cutoff = 0.02)
+long.range <- c(78.2,80);lat.range <- c(40.4,41.5)
+# Apply the function to each point in the data frame
+xinjiang.test$distance_to_ref <- mapply(calculate_distance,
+                                        xinjiang.test$longitude, 
+                                        xinjiang.test$latitude)
+# Visualize the mean of spatial random effect
+pix1 <- fm_pixels(mesh1, dims = c(300, 300))
+# Visualize the response mean
+pred1 <- predict(q2.m3.bru, pix1, ~ floc+Intercept+distance_to_ref)
+# Function to create concentric circles
+create_circles <- function(center, radii, nPoints = 100) {
+  theta <- seq(0, 2 * pi, length.out = nPoints)
+  circles <- lapply(seq_along(radii), function(i) {
+    r <- radii[i]
+    data.frame(
+      x = center[1] + r * cos(theta),
+      y = center[2] + r * sin(theta),
+      circle = i
+    )
+  })
+  do.call(rbind, circles)
+}
+# Define the center and radii
+center <- c(78.62, 41.28)
+radii <- seq(8, 40, by = 8) / 111  # Convert km to degrees
+# Create the circles data
+circles_data <- create_circles(center, radii)
+long.range <- c(78.1,79.6);lat.range <- c(40.3,41.6)
+# Plot
+ggplot() + gg(pred1, geom = "tile",alpha = 1) +
+  geom_point(data = xinjiang.test, aes(x = longitude, 
+                                       y = latitude, size = magnitudes),
+             color = "black", alpha = 0.2) +
+  geom_point(data = data.frame(x = center[1], y = center[2]),
+             aes(x = x, y = y), color = "red", size = 2) +
+  geom_path(data = circles_data, aes(x = x, y = y, group = circle), 
+            linetype = "dashed",linewidth=0.2) +
+  ggtitle("Predicted Magnitude Distribution") +
+  scale_fill_scico(palette = "lajolla", limits = range(pred1$mean)) +
+  coord_fixed(ratio = 1) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, size = 12))+
+  xlim(long.range)+ylim(lat.range)
+```
